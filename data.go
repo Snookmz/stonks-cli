@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 	"sync"
@@ -170,7 +171,6 @@ func fetchAll(ps []Portfolio, keys []string) (map[int]map[string]*PeriodData, er
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var firstErr error
-	sem := make(chan struct{}, 2)
 	for _, p := range ps {
 		out[p.ID] = map[string]*PeriodData{}
 		for _, k := range keys {
@@ -180,8 +180,6 @@ func fetchAll(ps []Portfolio, keys []string) (map[int]map[string]*PeriodData, er
 			wg.Add(1)
 			go func(p Portfolio, per Period, pd *PeriodData) {
 				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
 				r, err := performance(p, periodStart(p, per))
 				mu.Lock()
 				defer mu.Unlock()
@@ -213,4 +211,169 @@ func indexChart(p Portfolio, start string) (*IndexChart, error) {
 	q := url.Values{"start_date": {start}, "end_date": {today().Format("2006-01-02")}}
 	err := get(fmt.Sprintf("portfolios/%d/performance_index_chart", p.ID), q, &c)
 	return &c, err
+}
+
+// ---- price history ----
+// Sharesight has no per-holding chart, so a holding's price history comes from performance reports
+// ending on past dates: one report per date covers every holding in the portfolio. Today's point
+// comes from the report already loaded.
+
+type pricePoint struct {
+	Date  string
+	Price float64
+	Qty   float64
+}
+
+// split is a share split (or consolidation) found in a price history: Ratio new shares per old.
+type split struct {
+	Date  string
+	Ratio float64
+}
+
+// splitRatio is true when r (or 1/r, for a consolidation) is a usual split ratio. Real splits change
+// the quantity held exactly; a buy or sale in the same month as a price fall usually doesn't land
+// on one of these.
+func splitRatio(r float64) bool {
+	if r < 1 {
+		r = 1 / r
+	}
+	for _, s := range []float64{1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 15, 20, 25, 30, 40, 50, 100} {
+		if math.Abs(r/s-1) < 0.01 {
+			return true
+		}
+	}
+	return false
+}
+
+// adjustSplits rescales prices before each split so the series is comparable with today's price.
+// Sharesight reports past prices as they were, so a 15:1 split looks like a 93% fall. A split
+// shows as the quantity held changing by some factor while the price moves by its inverse.
+func adjustSplits(pts []pricePoint) ([]pricePoint, []split) {
+	out := append([]pricePoint(nil), pts...)
+	var found []split
+	factor := 1.0
+	for i := len(out) - 1; i > 0; i-- {
+		a, b := pts[i-1], pts[i]
+		if a.Qty > 0 && b.Qty > 0 && a.Price > 0 {
+			r := b.Qty / a.Qty
+			if splitRatio(r) && math.Abs(b.Price/a.Price*r-1) < 0.2 {
+				factor /= r
+				found = append([]split{{b.Date, r}}, found...)
+			}
+		}
+		out[i-1].Price = pts[i-1].Price * factor
+	}
+	return out, found
+}
+
+// histTTL is how long a past-dated report is kept. Past figures rarely change, but a transaction
+// entered late can alter them, so they don't last forever.
+const histTTL = 7 * 24 * time.Hour
+
+// chartPeriods are the price chart's periods. Each uses a fixed date grid (weekdays, Fridays or
+// month ends) so the reports stay cached as the days go by, and periods on the same grid share them.
+var chartPeriods = []struct {
+	Key, Grid string
+	Back      func(time.Time) time.Time // start of the period; nil = since inception
+}{
+	{"1m", "daily", func(t time.Time) time.Time { return t.AddDate(0, -1, 0) }},
+	{"3m", "weekly", func(t time.Time) time.Time { return t.AddDate(0, -3, 0) }},
+	{"6m", "weekly", func(t time.Time) time.Time { return t.AddDate(0, -6, 0) }},
+	{"1y", "weekly", func(t time.Time) time.Time { return t.AddDate(-1, 0, 0) }},
+	{"3y", "monthly", func(t time.Time) time.Time { return t.AddDate(-3, 0, 0) }},
+	{"5y", "monthly", func(t time.Time) time.Time { return t.AddDate(-5, 0, 0) }},
+	{"all", "monthly", nil},
+}
+
+const defaultChartPeriod = 3 // 1y
+
+// historyDates are the grid dates for chart period per in the time before now (not today, not
+// before inception), oldest first.
+func historyDates(p Portfolio, now time.Time, per int) []string {
+	cp := chartPeriods[per]
+	end := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	from := time.Time{}
+	if cp.Back != nil {
+		from = cp.Back(end)
+	}
+	if inc, err := time.ParseInLocation("2006-01-02", p.InceptionDate, now.Location()); err == nil && inc.After(from) {
+		from = inc
+	}
+	var out []string
+	add := func(d time.Time) bool {
+		if d.Before(from) {
+			return false
+		}
+		out = append(out, d.Format("2006-01-02"))
+		return true
+	}
+	d := end.AddDate(0, 0, -1)
+	switch cp.Grid {
+	case "daily":
+		for ; ; d = d.AddDate(0, 0, -1) {
+			if d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
+				continue
+			}
+			if !add(d) {
+				break
+			}
+		}
+	case "weekly":
+		for d.Weekday() != time.Friday {
+			d = d.AddDate(0, 0, -1)
+		}
+		for add(d) {
+			d = d.AddDate(0, 0, -7)
+		}
+	case "monthly":
+		// last day of each month before today
+		m := time.Date(end.Year(), end.Month(), 1, 0, 0, 0, 0, end.Location()).AddDate(0, 0, -1)
+		for add(m) {
+			m = time.Date(m.Year(), m.Month(), 1, 0, 0, 0, 0, m.Location()).AddDate(0, 0, -1)
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// priceHistory fetches p's prices on chart period per's dates, by holding ID, oldest first.
+// Dates that fail are left out; failed says how many.
+func priceHistory(p Portfolio, per int) (byHolding map[int][]pricePoint, failed int, err error) {
+	dates := historyDates(p, today(), per)
+	reports := make([]*Report, len(dates))
+	errs := make([]error, len(dates))
+	var wg sync.WaitGroup
+	for i, d := range dates {
+		wg.Add(1)
+		go func(i int, d string) {
+			defer wg.Done()
+			var r struct {
+				Report Report `json:"report"`
+			}
+			q := url.Values{"start_date": {p.InceptionDate}, "end_date": {d}}
+			if errs[i] = getTTL(fmt.Sprintf("portfolios/%d/performance", p.ID), q, &r, histTTL); errs[i] == nil {
+				reports[i] = &r.Report
+			}
+		}(i, d)
+	}
+	wg.Wait()
+	byHolding = map[int][]pricePoint{}
+	for i, r := range reports {
+		if r == nil {
+			failed++
+			err = errs[i]
+			continue
+		}
+		for _, h := range r.Holdings {
+			if h.Quantity != 0 && h.Price != 0 {
+				byHolding[h.ID] = append(byHolding[h.ID], pricePoint{dates[i], h.Price, h.Quantity})
+			}
+		}
+	}
+	if failed < len(dates) {
+		err = nil // partial history is still worth showing
+	}
+	return byHolding, failed, err
 }

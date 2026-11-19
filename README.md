@@ -14,6 +14,10 @@ Sharesight's API keys can also write, so nothing here ever POSTs/PUTs/DELETEs da
     -p NAME  one portfolio     --fresh  skip the 10-minute cache
 
 - Credentials: `~/.config/sharesight/credentials` (mode 600), `SHARESIGHT_CLIENT_ID=` / `SHARESIGHT_CLIENT_SECRET=`.
+- A holding's page in `stonks` charts its price; `[` and `]` pick 1m 3m 6m 1y (default) 3y 5y all. Sharesight has
+  no per-holding chart, so this comes from a performance report per date (weekdays for 1m, Fridays up to 1y,
+  month ends beyond: 20-80 requests the first time for each portfolio and grid, then cached for a week). Past
+  prices are adjusted for share splits, detected from the quantity held.
 - Cache and token: `~/.cache/stonks/`. Snapshots: `~/.local/share/stonks/snapshots.jsonl`.
 - Sharesight returns per-annum figures for any period over a year (account setting; the API flag is ignored).
 - Sharesight answers 403 to bursts of requests; the client runs 2 at a time and backs off on 403.

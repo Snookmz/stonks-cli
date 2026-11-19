@@ -28,6 +28,8 @@ var (
 	cacheTTL  = 10 * time.Minute
 	fresh     bool // --fresh: skip the response cache
 	httpc     = &http.Client{Timeout: 45 * time.Second}
+	// Sharesight answers 403 to bursts, so at most 2 requests are in flight across the whole program.
+	reqSem = make(chan struct{}, 2)
 )
 
 func loadCreds() (id, secret string, err error) {
@@ -94,16 +96,25 @@ func token() (string, error) {
 	return t.Token, nil
 }
 
-// get fetches an /api/v3 path (GET only) into out, using a 10-minute disk cache.
+// get fetches an /api/v3 path (GET only) into out, using a 10-minute disk cache (skipped with --fresh).
 func get(path string, q url.Values, out any) error {
+	ttl := cacheTTL
+	if fresh {
+		ttl = 0
+	}
+	return getTTL(path, q, out, ttl)
+}
+
+// getTTL is get with an explicit cache lifetime; 0 always asks Sharesight.
+func getTTL(path string, q url.Values, out any, ttl time.Duration) error {
 	u := apiBase + "/api/v3/" + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
 	sum := sha256.Sum256([]byte(u))
 	cp := filepath.Join(cacheDir, "http", hex.EncodeToString(sum[:8])+".json")
-	if !fresh {
-		if st, err := os.Stat(cp); err == nil && time.Since(st.ModTime()) < cacheTTL {
+	if ttl > 0 {
+		if st, err := os.Stat(cp); err == nil && time.Since(st.ModTime()) < ttl {
 			if b, err := os.ReadFile(cp); err == nil && json.Unmarshal(b, out) == nil {
 				return nil
 			}
@@ -117,12 +128,15 @@ func get(path string, q url.Values, out any) error {
 		}
 		req, _ := http.NewRequest(http.MethodGet, u, nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
+		reqSem <- struct{}{}
 		resp, err := httpc.Do(req)
 		if err != nil {
+			<-reqSem
 			return err
 		}
 		body, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
+		<-reqSem
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
 			os.Remove(filepath.Join(cacheDir, "token.json"))
 			continue

@@ -2,10 +2,14 @@ package main
 
 // stonks ui: an interactive view. One tab for all portfolios together, one per portfolio with its
 // holdings, and a detail page per holding. Everything comes from a single fetch (the same requests
-// `stonks` makes), so moving around never touches the network; only `r` fetches again.
+// `stonks` makes), so moving around never touches the network; only `r` fetches again. The one
+// exception is the price chart on a holding's page: the first time a portfolio's holding is opened,
+// its price history for the chosen period is fetched once (cached for a week) and shared by all its
+// holdings.
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -20,8 +24,8 @@ type loadedMsg struct {
 	err  error
 }
 
-// load fetches every period for every portfolio. Only one runs at a time (fetchAll's limit of 2
-// concurrent requests is per call), so the model never starts a second while one is in flight.
+// load fetches every period for every portfolio. Only one runs at a time, because it sets the
+// global fresh flag that get reads.
 func load(pf string, refresh bool) tea.Cmd {
 	return func() tea.Msg {
 		fresh = refresh
@@ -35,6 +39,41 @@ func load(pf string, refresh bool) tea.Cmd {
 	}
 }
 
+// histKey is one portfolio's history for one chart period (an index into chartPeriods).
+type histKey struct{ pid, per int }
+
+// histState is one portfolio's price history for one period: loading until the fetch returns.
+type histState struct {
+	loading bool
+	prices  map[int][]pricePoint // by holding ID
+	failed  int                  // dates that couldn't be fetched
+	err     error
+}
+
+type histMsg struct {
+	key    histKey
+	prices map[int][]pricePoint
+	failed int
+	err    error
+}
+
+// ensureHistory starts fetching p's price history for the current chart period, unless it is
+// loaded or on its way.
+func (m *model) ensureHistory(p Portfolio) tea.Cmd {
+	if m.hist == nil {
+		m.hist = map[histKey]*histState{}
+	}
+	k := histKey{p.ID, m.chartPer}
+	if st := m.hist[k]; st != nil && (st.loading || st.err == nil) {
+		return nil
+	}
+	m.hist[k] = &histState{loading: true}
+	return func() tea.Msg {
+		prices, failed, err := priceHistory(p, k.per)
+		return histMsg{k, prices, failed, err}
+	}
+}
+
 type model struct {
 	pf       string
 	fresh    bool // --fresh on the command line: skip the cache on the first load
@@ -44,12 +83,14 @@ type model struct {
 	err      error
 	loadedAt time.Time
 
-	tab     int         // 0 = Combined when there's more than one portfolio
-	cursor  map[int]int // per tab
-	offset  map[int]int // first visible holding row, per tab
-	sortIdx int
-	detail  bool
-	w, h    int
+	tab      int         // 0 = Combined when there's more than one portfolio
+	cursor   map[int]int // per tab
+	offset   map[int]int // first visible holding row, per tab
+	sortIdx  int
+	detail   bool
+	w, h     int
+	hist     map[histKey]*histState
+	chartPer int // index into chartPeriods
 }
 
 // interactive is true when stonks is attached to a terminal both ways (not a pipe or cron).
@@ -61,7 +102,7 @@ func cmdUI(pf string) error {
 	if !interactive() {
 		return fmt.Errorf("stonks ui needs a terminal (try 'stonks summary' instead)")
 	}
-	m := &model{pf: pf, fresh: fresh, loading: true, cursor: map[int]int{}, offset: map[int]int{}, w: 80, h: 24}
+	m := &model{pf: pf, fresh: fresh, loading: true, chartPer: defaultChartPeriod, cursor: map[int]int{}, offset: map[int]int{}, w: 80, h: 24}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -127,6 +168,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+	case histMsg:
+		if m.hist == nil {
+			m.hist = map[histKey]*histState{}
+		}
+		m.hist[msg.key] = &histState{prices: msg.prices, failed: msg.failed, err: msg.err}
 	case loadedMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -181,6 +227,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setTab(m.cursor[m.tab] + 1)
 			} else if m.rowCount() > 0 {
 				m.detail = true
+				return m, m.ensureHistory(*m.portfolio())
+			}
+		case "[", "]":
+			if m.detail {
+				d := 1
+				if k == "[" {
+					d = -1
+				}
+				m.chartPer = max(0, min(len(chartPeriods)-1, m.chartPer+d))
+				return m, m.ensureHistory(*m.portfolio())
 			}
 		case "esc", "backspace":
 			m.detail = false
@@ -249,7 +305,7 @@ func (m *model) tabBar() string {
 func (m *model) footer() string {
 	keys := "←→ tabs   ↑↓ move   enter open   s sort   r refresh   q quit"
 	if m.detail {
-		keys = "↑↓ next holding   esc back   ←→ tabs   r refresh   q quit"
+		keys = "↑↓ next holding   [ ] chart period   esc back   ←→ tabs   r refresh   q quit"
 	} else if m.portfolio() == nil {
 		keys = "←→ tabs   ↑↓ move   enter open portfolio   r refresh   q quit"
 	}
@@ -334,8 +390,84 @@ func (m *model) viewPortfolio(p Portfolio) string {
 func (m *model) viewDetail(p Portfolio) string {
 	rows := m.rows()
 	c := min(m.cursor[m.tab], len(rows)-1)
-	s := holdingDetail(p, m.data[p.ID], rows[c].h)
-	return s + dim(fmt.Sprintf("  %d of %d in %s, sorted by %s", c+1, len(rows), p.Name, sortName(sortKeys[m.sortIdx]))) + "\n"
+	h := rows[c].h
+	s := holdingDetail(p, m.data[p.ID], h)
+	foot := dim(fmt.Sprintf("  %d of %d in %s, sorted by %s", c+1, len(rows), p.Name, sortName(sortKeys[m.sortIdx]))) + "\n"
+	free := m.h - chromeLines - strings.Count(s+foot, "\n")
+	return s + m.priceChart(p, h, free) + foot
+}
+
+// periodBar is the chart period selector, the current period highlighted.
+func (m *model) periodBar() string {
+	var parts []string
+	for i, cp := range chartPeriods {
+		if i == m.chartPer {
+			parts = append(parts, paint("1;7", " "+cp.Key+" "))
+		} else {
+			parts = append(parts, dim(" "+cp.Key+" "))
+		}
+	}
+	return "  " + bold("Price") + "   " + strings.Join(parts, " ") + "   " + dim("[ ] change period")
+}
+
+// priceChart draws h's price over the chosen period in at most rows lines (see areaChart).
+func (m *model) priceChart(p Portfolio, h Holding, rows int) string {
+	if rows < 3 {
+		return ""
+	}
+	head := m.periodBar() + "\n"
+	note := func(s string) string { return head + "  " + s + "\n\n" }
+	st := m.hist[histKey{p.ID, m.chartPer}]
+	switch {
+	case st == nil || st.loading:
+		n := len(historyDates(p, today(), m.chartPer))
+		secs := max(5, (n*55/100+4)/5*5) // ~0.55 s a date at 2 requests at a time
+		return note(dim(fmt.Sprintf("Loading the price history… (about %d seconds the first time)", secs)))
+	case st.err != nil:
+		return note(paint("31", "Price history unavailable: ") + truncate(st.err.Error(), max(20, m.w-34)))
+	}
+	pts := st.prices[h.ID]
+	if end := m.data[p.ID]["all"].Report.EndDate; h.Price != 0 && (len(pts) == 0 || pts[len(pts)-1].Date < end) {
+		pts = append(pts, pricePoint{end, h.Price, h.Quantity}) // today's price, from the report already loaded
+	}
+	pts, splits := adjustSplits(pts)
+	if len(pts) < 2 {
+		return note(dim("Not enough price history to chart for this period."))
+	}
+	if rows < 10 {
+		return note(dim("Make the window taller to see the price chart."))
+	}
+	vals := make([]float64, len(pts))
+	dates := make([]string, len(pts))
+	for i, pt := range pts {
+		vals[i], dates[i] = pt.Price, pt.Date
+	}
+	first, last := vals[0], vals[len(vals)-1]
+	change := (last/first - 1) * 100
+	cp := chartPeriods[m.chartPer]
+	sub := fmt.Sprintf("  %s %s → %s   %s   %s", h.Instrument.Currency, commas(first, 2), commas(last, 2),
+		signed(change, pct(change)), dim("since "+pts[0].Date+", "+cp.Grid))
+	if st.failed > 0 {
+		sub += dim(fmt.Sprintf(" (%d dates missing)", st.failed))
+	}
+	for _, sp := range splits {
+		r := fmt.Sprintf("%g:1 split", math.Round(sp.Ratio*100)/100)
+		if sp.Ratio < 1 {
+			r = fmt.Sprintf("1:%g consolidation", math.Round(100/sp.Ratio)/100)
+		}
+		sub += dim(" · earlier prices adjusted for a " + r + " by " + sp.Date)
+	}
+	head += sub + "\n\n"
+	unit := map[string]tickUnit{"daily": tickWeek, "weekly": tickMonth, "monthly": tickYear}[cp.Grid]
+	if cp.Key == "3y" {
+		unit = tickQuarter
+	}
+	fill := func(s string) string { return signed(change, s) }
+	// the tallest chart (up to 18 rows with its timeline) that fits under the heading
+	if lines := areaChart(vals, dates, m.w-2, min(18, rows-4), unit, fill); lines != nil {
+		return head + strings.Join(lines, "\n") + "\n\n"
+	}
+	return note(dim("Make the window taller to see the price chart."))
 }
 
 func sortName(k string) string {
