@@ -3,8 +3,9 @@
 Your Sharesight portfolios in the terminal. Go, single binary, read-only (GET requests only;
 Sharesight's API keys can also write, so nothing here ever POSTs/PUTs/DELETEs data).
 
-    stonks                     summary for every period (today ... all time)
-    stonks ui                  interactive: Combined tab + a tab per portfolio, enter on a holding for detail
+    stonks                     interactive: Combined tab + a tab per portfolio, enter on a holding for detail
+                               (in a pipe or script it prints the summary instead)
+    stonks summary             summary for every period (today ... all time)
     stonks holdings [-s KEY]   all holdings; sort: value (default) today 1m 1y all code
     stonks show CODE           one holding in detail
     stonks chart [PERIOD]      performance chart: 1w 1m ytd 1y 3y 5y all

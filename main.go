@@ -16,8 +16,9 @@ import (
 
 const usage = `stonks: your Sharesight portfolios in the terminal
 
-  stonks                     summary: value and gains for every period
-  stonks ui                  interactive: tabs per portfolio, drill into each holding
+  stonks                     interactive: tabs per portfolio, drill into each holding
+                             (prints the summary instead when not run in a terminal)
+  stonks summary             summary: value and gains for every period
   stonks holdings [-s KEY]   every holding; sort by value (default), today, 1m, 1y, all, code
   stonks show CODE           one holding in detail (e.g. stonks show CBA)
   stonks chart [PERIOD]      performance chart; PERIOD = 1m 1y (default) 3y 5y all
@@ -55,6 +56,9 @@ func main() {
 		}
 	}
 	cmd := "summary"
+	if interactive() {
+		cmd = "ui"
+	}
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
 	}

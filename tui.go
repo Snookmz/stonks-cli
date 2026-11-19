@@ -52,9 +52,14 @@ type model struct {
 	w, h    int
 }
 
+// interactive is true when stonks is attached to a terminal both ways (not a pipe or cron).
+func interactive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
+}
+
 func cmdUI(pf string) error {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
-		return fmt.Errorf("stonks ui needs a terminal (try plain 'stonks' instead)")
+	if !interactive() {
+		return fmt.Errorf("stonks ui needs a terminal (try 'stonks summary' instead)")
 	}
 	m := &model{pf: pf, fresh: fresh, loading: true, cursor: map[int]int{}, offset: map[int]int{}, w: 80, h: 24}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
