@@ -100,6 +100,11 @@ func truncate(s string, n int) string {
 
 // table prints rows; align[i] true = right-align column i.
 func table(header []string, rows [][]string, align []bool) {
+	fmt.Print(tableString(header, rows, align))
+}
+
+// tableString renders rows as text, one line each; align[i] true = right-align column i.
+func tableString(header []string, rows [][]string, align []bool) string {
 	w := make([]int, len(header))
 	for i, h := range header {
 		w[i] = width(h)
@@ -111,6 +116,7 @@ func table(header []string, rows [][]string, align []bool) {
 			}
 		}
 	}
+	var b strings.Builder
 	line := func(cells []string, hdr bool) {
 		var parts []string
 		for i, c := range cells {
@@ -119,12 +125,13 @@ func table(header []string, rows [][]string, align []bool) {
 			}
 			parts = append(parts, pad(c, w[i], align[i]))
 		}
-		fmt.Println("  " + strings.TrimRight(strings.Join(parts, "   "), " "))
+		b.WriteString("  " + strings.TrimRight(strings.Join(parts, "   "), " ") + "\n")
 	}
 	line(header, true)
 	for _, r := range rows {
 		line(r, false)
 	}
+	return b.String()
 }
 
 func termWidth() int {

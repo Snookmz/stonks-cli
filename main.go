@@ -17,6 +17,7 @@ import (
 const usage = `stonks: your Sharesight portfolios in the terminal
 
   stonks                     summary: value and gains for every period
+  stonks ui                  interactive: tabs per portfolio, drill into each holding
   stonks holdings [-s KEY]   every holding; sort by value (default), today, 1m, 1y, all, code
   stonks show CODE           one holding in detail (e.g. stonks show CBA)
   stonks chart [PERIOD]      performance chart; PERIOD = 1m 1y (default) 3y 5y all
@@ -81,6 +82,8 @@ func main() {
 			fmt.Sscan(args[0], &n)
 		}
 		err = cmdHistory(pf, n)
+	case "ui", "i":
+		err = cmdUI(pf)
 	case "pull":
 		err = cmdPull()
 	default:
@@ -134,31 +137,36 @@ func cmdSummary(pf string) error {
 	}
 	if len(ps) > 1 {
 		fmt.Printf("  %s   %s\n\n", bold("Combined"), bold(money(total)))
-		summaryTable(func(k string) (Gains, bool) {
-			per, _ := periodByKey(k)
-			var g Gains
-			var base, wsum float64
-			for _, p := range ps {
-				r := data[p.ID][k].Report
-				g.TotalGain += r.TotalGain
-				base += impliedBase(r)
-				wsum += r.TotalGainPercent * r.Value
-			}
-			if per.Annualise {
-				// p.a. figures can't be added up; value-weighted average, marked approximate
-				g.TotalGainPercent = wsum / total
-				return g, true
-			}
-			if base != 0 {
-				g.TotalGainPercent = g.TotalGain / base * 100
-			}
-			return g, false
-		})
+		summaryTable(func(k string) (Gains, bool) { return combinedGains(ps, data, k, total) })
 		fmt.Println()
 	}
 	fmt.Println(dim("  Sharesight's returns; over a year they're per annum (≈ = value-weighted average). Not advice."))
 	fmt.Println()
 	return nil
+}
+
+// combinedGains adds up period k across portfolios (total = their combined value). The bool is true
+// when the % is approximate: p.a. figures can't be added up, so they're a value-weighted average.
+func combinedGains(ps []Portfolio, data map[int]map[string]*PeriodData, k string, total float64) (Gains, bool) {
+	per, _ := periodByKey(k)
+	var g Gains
+	var base, wsum float64
+	for _, p := range ps {
+		r := data[p.ID][k].Report
+		g.TotalGain += r.TotalGain
+		base += impliedBase(r)
+		wsum += r.TotalGainPercent * r.Value
+	}
+	if per.Annualise {
+		if total != 0 {
+			g.TotalGainPercent = wsum / total
+		}
+		return g, true
+	}
+	if base != 0 {
+		g.TotalGainPercent = g.TotalGain / base * 100
+	}
+	return g, false
 }
 
 // impliedBase backs out the capital a % was measured against, so portfolios can be combined.
@@ -170,7 +178,9 @@ func impliedBase(r *Report) float64 {
 }
 
 // summaryTable prints one row per period. get returns the gains and whether the % is approximate.
-func summaryTable(get func(k string) (Gains, bool)) {
+func summaryTable(get func(k string) (Gains, bool)) { fmt.Print(summaryString(get)) }
+
+func summaryString(get func(k string) (Gains, bool)) string {
 	var rows [][]string
 	for _, per := range periods {
 		g, approx := get(per.Key)
@@ -185,7 +195,7 @@ func summaryTable(get func(k string) (Gains, bool)) {
 		rows = append(rows, []string{label(per), signed(g.TotalGain, moneySigned(g.TotalGain)),
 			signed(g.TotalGainPercent, p), pa})
 	}
-	table([]string{"", "gain", "return", ""}, rows, []bool{false, true, true, false})
+	return tableString([]string{"", "gain", "return", ""}, rows, []bool{false, true, true, false})
 }
 
 // ---- holdings ----
@@ -197,16 +207,11 @@ type hrow struct {
 	gain float64            // all-time $
 }
 
-func cmdHoldings(pf, sortKey string) error {
-	ps, err := portfolios(pf)
-	if err != nil {
-		return err
-	}
-	keys := []string{"today", "1m", "1y", "all"}
-	data, err := fetchAll(ps, keys)
-	if err != nil {
-		return err
-	}
+// holdingKeys are the periods the holdings table shows.
+var holdingKeys = []string{"today", "1m", "1y", "all"}
+
+// holdingRows lists every holding in ps with its % for each holdingKeys period, plus the total value.
+func holdingRows(ps []Portfolio, data map[int]map[string]*PeriodData) ([]hrow, float64) {
 	var rows []hrow
 	var total float64
 	for _, p := range ps {
@@ -214,7 +219,7 @@ func cmdHoldings(pf, sortKey string) error {
 		total += all.Value
 		for _, h := range all.Holdings {
 			r := hrow{pf: p.Name, h: h, per: map[string]float64{}, gain: h.TotalGain}
-			for _, k := range keys {
+			for _, k := range holdingKeys {
 				for _, x := range data[p.ID][k].Report.Holdings {
 					if x.ID == h.ID {
 						r.per[k] = x.TotalGainPercent
@@ -224,6 +229,12 @@ func cmdHoldings(pf, sortKey string) error {
 			rows = append(rows, r)
 		}
 	}
+	return rows, total
+}
+
+var sortKeys = []string{"value", "today", "1m", "1y", "all", "code"}
+
+func sortHoldings(rows []hrow, sortKey string) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		switch sortKey {
 		case "code", "name":
@@ -233,25 +244,43 @@ func cmdHoldings(pf, sortKey string) error {
 		}
 		return rows[i].h.Value > rows[j].h.Value
 	})
-	hdr := []string{"code", "name", "value", "weight", dayLabel(), "1 month", "1 year", "all time p.a.", "all-time gain"}
-	align := []bool{false, false, true, true, true, true, true, true, true}
-	if len(ps) > 1 {
+}
+
+// holdingTable builds the holdings table; weight is relative to total. multi adds a portfolio column.
+func holdingTable(rows []hrow, total float64, multi bool) (hdr []string, out [][]string, align []bool) {
+	hdr = []string{"code", "name", "value", "weight", dayLabel(), "1 month", "1 year", "all time p.a.", "all-time gain"}
+	align = []bool{false, false, true, true, true, true, true, true, true}
+	if multi {
 		hdr = append(hdr, "portfolio")
 		align = append(align, false)
 	}
-	var out [][]string
 	for _, r := range rows {
 		c := []string{bold(r.h.Instrument.Code), truncate(r.h.Instrument.Name, 24), money(r.h.Value),
 			fmt.Sprintf("%.1f%%", r.h.Value/total*100)}
-		for _, k := range keys {
+		for _, k := range holdingKeys {
 			c = append(c, signed(r.per[k], pct(r.per[k])))
 		}
 		c = append(c, signed(r.gain, moneySigned(r.gain)))
-		if len(ps) > 1 {
+		if multi {
 			c = append(c, dim(r.pf))
 		}
 		out = append(out, c)
 	}
+	return hdr, out, align
+}
+
+func cmdHoldings(pf, sortKey string) error {
+	ps, err := portfolios(pf)
+	if err != nil {
+		return err
+	}
+	data, err := fetchAll(ps, holdingKeys)
+	if err != nil {
+		return err
+	}
+	rows, total := holdingRows(ps, data)
+	sortHoldings(rows, sortKey)
+	hdr, out, align := holdingTable(rows, total, len(ps) > 1)
 	fmt.Println()
 	table(hdr, out, align)
 	fmt.Printf("\n  %d holdings, %s\n\n", len(rows), bold(money(total)))
@@ -277,30 +306,38 @@ func cmdShow(pf, code string) error {
 				continue
 			}
 			found = true
-			in := h.Instrument
-			fmt.Printf("\n  %s  %s  %s\n", bold(in.Code), in.Name, dim(in.Market+" · "+p.Name))
-			if in.Sector != "" {
-				fmt.Printf("  %s\n", dim(in.Sector+" · "+in.Industry))
-			}
-			fmt.Printf("\n  %s × %s = %s   %s\n\n", commas(h.Quantity, 0), "$"+commas(h.Price, 3), bold(money(h.Value)),
-				dim(fmt.Sprintf("%.1f%% of %s", h.Value/all.Value*100, p.Name)))
-			summaryTable(func(k string) (Gains, bool) {
-				for _, x := range data[p.ID][k].Report.Holdings {
-					if x.ID == h.ID {
-						return x.Gains, false
-					}
-				}
-				return Gains{}, false
-			})
-			fmt.Printf("  %s  capital %s · dividends %s · currency %s\n\n", dim("All time:"),
-				signed(h.CapitalGain, moneySigned(h.CapitalGain)), signed(h.PayoutGain, moneySigned(h.PayoutGain)),
-				signed(h.CurrencyGain, moneySigned(h.CurrencyGain)))
+			fmt.Print(holdingDetail(p, data[p.ID], h))
 		}
 	}
 	if !found {
 		return fmt.Errorf("no holding %q (try: stonks holdings)", strings.ToUpper(code))
 	}
 	return nil
+}
+
+// holdingDetail renders one holding: what it is, the position, and its gains for every period.
+func holdingDetail(p Portfolio, d map[string]*PeriodData, h Holding) string {
+	var b strings.Builder
+	all := d["all"].Report
+	in := h.Instrument
+	fmt.Fprintf(&b, "\n  %s  %s  %s\n", bold(in.Code), in.Name, dim(in.Market+" · "+p.Name))
+	if in.Sector != "" {
+		fmt.Fprintf(&b, "  %s\n", dim(in.Sector+" · "+in.Industry))
+	}
+	fmt.Fprintf(&b, "\n  %s × %s = %s   %s\n\n", commas(h.Quantity, 0), "$"+commas(h.Price, 3), bold(money(h.Value)),
+		dim(fmt.Sprintf("%.1f%% of %s", h.Value/all.Value*100, p.Name)))
+	b.WriteString(summaryString(func(k string) (Gains, bool) {
+		for _, x := range d[k].Report.Holdings {
+			if x.ID == h.ID {
+				return x.Gains, false
+			}
+		}
+		return Gains{}, false
+	}))
+	fmt.Fprintf(&b, "  %s  capital %s · dividends %s · currency %s\n\n", dim("All time:"),
+		signed(h.CapitalGain, moneySigned(h.CapitalGain)), signed(h.PayoutGain, moneySigned(h.PayoutGain)),
+		signed(h.CurrencyGain, moneySigned(h.CurrencyGain)))
+	return b.String()
 }
 
 // ---- chart ----
